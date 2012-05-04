@@ -12,6 +12,7 @@ use Expect;
 use Crypt::CBC;					# also requires Crypt::OpenSSL::AES
 use MIME::Base64;
 use Getopt::Long;
+use Net::Domain qw(hostfqdn);
 
 # you might need to change these:
 my $timeout = 5;
@@ -213,10 +214,100 @@ sub imap_connect_orig() {
 sub smtp_connect() {
     foreach my $account (get_accounts()) {
         if (@$account[0] eq "$opt_alias:$opt_type") {
-            my $exp = Expect->spawn("$OPENSSL s_client -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
-            $exp->expect(10, '-re', '');
-            $exp->send(". login @$account[2] @$account[3]\n");
-            $exp->expect(10, '-re', '');
+            my $exp = Expect->spawn("$OPENSSL s_client -CAfile yahoo.pem -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
+
+# 220 mx.google.com ESMTP gf8sm9922774obc.3
+# EHLO androgynoid.com
+# 250-mx.google.com at your service, [96.18.15.251]
+# 250-SIZE 35882577
+# 250-8BITMIME
+# 250-AUTH LOGIN PLAIN XOAUTH
+# 250 ENHANCEDSTATUSCODES
+
+# "AUTH PLAIN " + encode_base64("\000" + @$account[2] + "\000" + @$account[3])
+# AUTH PLAIN BASE64BLAHBLAHBLAH
+# 535-5.7.1 Username and Password not accepted. Learn more at
+# 535 5.7.1 http://support.google.com/mail/bin/answer.py?answer=14257 ch5sm9983258obb.16
+# AUTH PLAIN BASE64BLAHBLAHBLAH
+# 235 2.7.0 Accepted
+
+# gmail:
+# AUTH LOGIN
+# 334 VXNlcm5hbWU6
+# encode_base64(@$account[2])
+# 334 UGFzc3dvcmQ6
+# encode_base64(@$account[3])
+# 235 2.7.0 Accepted
+
+            my $auth_plain = 0;
+            my $auth_login = 0;
+            my $sent_user = 0;
+            my $sent_pass = 0;
+            $exp->expect($timeout,
+                [
+                    '-re', '^220',
+                    sub {
+                        my $fh = shift;
+                        my $fqdn =  hostfqdn();
+                        $fh->send("EHLO $fqdn\n");
+                        exp_continue;
+                    }
+                ], [
+                    '-re', '^250.*AUTH.* PLAIN',
+                    sub {
+                        $auth_plain = 1;
+                        chomp(my $userpass = encode_base64("\000" . @$account[2] . "\000" . @$account[3]));
+                        my $fh = shift;
+                        $fh->send("AUTH PLAIN $userpass\n");
+                        exp_continue;
+                    }
+                ], [
+                    '-re', '^250.*AUTH.* LOGIN',
+                    sub {
+                        if (!$auth_plain) {
+                            $auth_login = 1;
+                            my $fh = shift;
+                            $fh->send("AUTH LOGIN\n");
+                            exp_continue;
+                        }
+                    }
+                ], [
+                    '-re', '^334 ',
+                    sub {
+                        my $fh = shift;
+                        if ($auth_login) {
+                            if (!$sent_user) {
+                                $sent_user = 1;
+                                chomp(my $username = encode_base64(@$account[2]));
+                                $fh->send("$username\n");
+                                exp_continue;
+                            } elsif (!$sent_pass) {
+                                $sent_pass = 1;
+                                chomp(my $password = encode_base64(@$account[3]));
+                                $fh->send("$password\n");
+                                exp_continue;
+                            } else {
+                                $fh->send("quit\n");
+                            }
+                        }
+                    }
+                ], [
+                    '-re', '^5',
+                    sub {
+                        my $fh = shift;
+                        $fh->send("QUIT\n");
+                    }
+                ], [
+                    timeout =>
+                    sub {
+                        die "timeout.\n";
+                    }
+                ],
+                '-re', '^235',		# 235 2.7.0 Accepted
+            );
+
+            # openssl's s_client traps lines starting with 'R' and 'Q'
+            print "IMPORTANT: type SMTP commands starting with 'r' or 'q' in *lower* case.\n";
             $exp->interact();
             $exp->soft_close();
             return;
@@ -254,7 +345,7 @@ sub pop3_connect() {
                     '-re', '^-ERR',
                     sub {
                         my $fh = shift;
-                        $fh->send("QUIT\n");
+                        $fh->send("quit\n");
                     }
                 ], [
                     timeout =>
@@ -265,6 +356,8 @@ sub pop3_connect() {
                 '-re', '^\+OK',		# wait for OK
             );
 
+            # openssl's s_client traps lines starting with 'R' and 'Q'
+            print "IMPORTANT: type POP3 commands starting with 'r' or 'q' in *lower* case.\n";
             $exp->interact();
             $exp->soft_close();
             return;
@@ -276,7 +369,7 @@ sub pop3_connect() {
 # returns true if an alias exists.
 # if passed a value other than 0, it will prompt whether to overwrite, and die if denied.
 sub check_for_alias($) {
-    my $verify = $_;
+    my $verify = $_[0];
     foreach (get_aliases()) {
         if ($_ eq "$opt_alias:$opt_type") {
             if ($verify) {
@@ -295,6 +388,20 @@ sub check_for_alias($) {
     return 0;
 }
 
+# returns 0 if passed 0.
+# returns 0 if alias not found with any type.
+# returns 1 if alias found with any type, setting $opt_type to the first type found.
+sub guess_and_set_type($) {
+    return 0 unless ($_[0]);
+    foreach (get_aliases()) {
+        if ($_ =~ /^$opt_alias:(?:imap|smtp|pop3)$/) {
+            (my $alias, $opt_type) = split(/:/);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 # adds or changes an alias in config file.
 sub create_alias() {
     my $alias_defined = check_for_alias(1);
@@ -302,8 +409,8 @@ sub create_alias() {
     my $password2 = '';
     my @accounts;
 
+    # ask for passphase just one and make sure we can decrypt the data first if a config file exists
     if (-e "$config_file") {
-        #prompt_for_passphrase();
         @accounts = get_accounts();
     } else {
         prompt_for_new_passphrase();
@@ -357,6 +464,7 @@ sub list_aliases() {
 }
 
 sub main() {
+    # option sanity
     if (($opt_server xor $opt_username) ||			# both must be defined
             ($opt_port && !$opt_server) ||			# port only used if server defined
             !($opt_list || ($opt_alias xor $ARGV[0])) ||	# alias as option and as argument cannot be defined.
@@ -371,10 +479,27 @@ sub main() {
         exit(0);
     }
 
+    # initialization
     $opt_alias = ($opt_alias) ? $opt_alias : $ARGV[0];
-    $opt_type = ($opt_type) ? $opt_type : $default_type;
-    $opt_port = ($opt_port) ? $opt_port : $types{$opt_type};
+    my $can_guess_type = ($opt_type) ? 0 : 1;			# allow guessing of type if not given and default (imap) not found
 
+    if (!$opt_type && $opt_server) {				# guess type from server name if type not given when adding aliases
+        if ($opt_server =~ /^imap/) {
+            $opt_type = "imap";
+        } elsif ($opt_server =~ /^smtp/) {
+            $opt_type = "smtp";
+        } elsif ($opt_server =~ /^pop/) {
+            $opt_type = "pop3";
+        }
+    } else {
+        $opt_type = ($opt_type) ? $opt_type : $default_type;
+    }
+
+    if ($opt_server) {
+        $opt_port = ($opt_port) ? $opt_port : $types{$opt_type};
+    }
+
+    # do it
     if ($opt_list) {
         list_aliases();
         exit(0);
@@ -382,7 +507,7 @@ sub main() {
         create_alias();
         exit(0);
     } else {
-        if (check_for_alias(0)) {
+        if (check_for_alias(0) || guess_and_set_type($can_guess_type)) {
             if ($opt_type eq "imap") {
                 imap_connect();
                 exit(0);
