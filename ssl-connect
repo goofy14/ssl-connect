@@ -1,0 +1,402 @@
+#!/usr/bin/perl -w
+
+# Copyright 2012 Ashley Willis <ashley@androgynoid.com>
+# Licensed under both the GNU General Public License version 2 or later, and the Artistic License.
+
+# requires the command-line program "openssl" to be in path.
+
+# notes: stty is not portable.
+
+use strict;
+use Expect;
+use Crypt::CBC;					# also requires Crypt::OpenSSL::AES
+use MIME::Base64;
+use Getopt::Long;
+
+# you might need to change these:
+my $timeout = 5;
+my $OPENSSL = "openssl";			# change this to the full path if needed
+my $config_file = "$ENV{'HOME'}/.ssl-connect";	# change this if needed
+my $separator = " ";				# change this if needed (to TAB or NULL, for example)
+                                                # the value of $separator cannot exist in usernames, account passwords, nor aliases.
+
+# NOTHING SHOULD BE CHANGED BELOW THIS LINE
+
+my %types = ( "imap" => 993,			# default ports as values for known types
+              "smtp" => 465, 
+              "pop3" => 995);
+my $default_type = "imap";
+
+my $opt_alias;
+my $opt_server;
+my $opt_port;
+my $opt_type;
+my $opt_username;
+my $opt_list = 0;
+my $opt_help = 0;
+
+my $options = GetOptions(
+    "alias=s" => \$opt_alias,
+    "server=s" => \$opt_server,
+    "port=i" => \$opt_port,
+    "type=s" => \$opt_type,
+    "username=s" => \$opt_username,
+    "config=s" => \$config_file,
+    "list" => \$opt_list,
+    "help" => \$opt_help,
+);
+
+# prints usage
+sub help() {
+    print "Usage: ssl-connect [--config CONFIG_FILE] [--type TYPE] [--alias] ALIAS
+       ssl-connect [--config CONFIG_FILE] --alias ALIAS --server SERVER \\
+                   [--type TYPE] [--port PORT] --username USERNAME
+       ssl-connect [--config CONFIG_FILE] --list
+
+A tool to open raw secure authenticated sessions, saving their passwords with
+a master passphrase. The first example connects to a predefined account
+according to the alias given, prompting for the passphrase. The second
+example creates encrypted settings for an account. It prompts for the account
+password, and then for a passphrase to encrypt the config file. The third
+example lists all aliases with their type in the config file.
+
+Options:
+  -a, --alias=ALIAS           an alias for this account, without its type
+  -s, --server=SERVER         the server name or IP address
+  -p, --port=PORT             the server port if different from the default
+                              (imap = 993, smtp = 465, pop3 = 995)
+  -t, --type=TYPE             currently imap, smtp, and pop3 (case-sensitive)
+                              defaults to imap if not given
+  -u, --username=USERNAME     the username for the account
+  -c, --config=CONFIG_FILE    specify config file (default: ~/.ssl-connect)
+  -l, --list                  list account aliases
+  -h, --help                  this help
+
+Copyright 2012 Ashley Willis <ashley\@androgynoid.com>
+Licensed under both the GNU General Public License version 2 or later, and the
+Artistic License.\n";
+}
+
+# returns an array of account aliases. does not require a password.
+sub get_aliases() {
+    die "config file $config_file does not exist\n" unless (-e $config_file);
+    open(CONFIG, "<$config_file") || die "cannot open config file $config_file\n";
+    chmod(0600, $config_file) or warn "Couldn't chmod $config_file: $!";
+    my @aliases;
+    while (<CONFIG>) {
+        (my $alias, my $data) = split(/$separator/, $_);
+        $aliases[@aliases] = $alias;
+    }
+    close(CONFIG);
+    return @aliases;
+}
+
+sub prompt_for_passphrase() {
+    if (!$::passphrase) {
+        print "enter passphrase:\n";
+        system('stty','-echo');
+        chop($::passphrase=<STDIN>);
+        system('stty','echo');
+    }
+}
+
+sub prompt_for_new_passphrase() {
+    if (!$::passphrase) {
+        my $passphrase2 = '';
+        do {
+            print "enter passphrase to encrypt with:\n";
+            chop($::passphrase=<STDIN>);
+            print "enter passphrase again:\n";
+            chop($passphrase2=<STDIN>);
+            print "passphrases do not match! " if ($::passphrase ne $passphrase2);
+        } while ($::passphrase ne $passphrase2);
+    }
+}
+
+# returns an array of array references of unencrypted accounts.
+sub get_accounts() {
+    prompt_for_passphrase();
+
+    my $cipher = Crypt::CBC->new(
+        -key    => $::passphrase,
+        -cipher => "Crypt::OpenSSL::AES"
+    );
+
+    die "config file $config_file does not exist\n" unless (-e $config_file);
+    open(CONFIG, "<$config_file") || die "cannot open config file $config_file\n";
+    chmod(0600, $config_file) or warn "Couldn't chmod $config_file: $!";
+
+    my @accounts;
+    while (<CONFIG>) {
+        (my $alias_type, my $data) = split(/$separator/, $_);
+        my $decrypted = $cipher->decrypt(decode_base64($data));
+        if ($decrypted =~ /.* .* .* .*/ || $decrypted =~ /[\x00-\x1F\xFF]/) {
+            die "decrypted data not in right format -- perhaps wrong passphrase given\n";# \"$decrypted\"\n";
+        }
+        (my $server, my $username, my $password) = split(/$separator/, $decrypted);
+        unless ($password) {
+            die "decrypted data not in right format -- perhaps wrong passphrase given\n";#: \"$decrypted\"\n";
+        }
+        push(@accounts, [($alias_type, $server, $username, $password)]);
+    }
+    close(CONFIG);
+    return @accounts;
+}
+
+# connects to an imap server
+# tries only the first alias that matches
+sub imap_connect() {
+    foreach my $account (get_accounts()) {
+        if (@$account[0] eq "$opt_alias:$opt_type") {
+            my $exp = Expect->spawn("$OPENSSL s_client -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
+#            my $spawn_ok;
+            $exp->expect($timeout,
+                [
+                    '-re',
+                    '^\* OK',
+                    sub {
+#                        $spawn_ok = 1;
+                        my $fh = shift;
+                        $fh->send(". login @$account[2] @$account[3]\n"); #$username\n");
+                        exp_continue;
+                    }
+                ], [
+                    '-re', '^\. NO',
+                    sub {
+                        my $fh = shift;
+                        $fh->send(". logout\n");
+                        #print STDERR "LOGIN NOT ACCEPTED\n";
+                        #exp_continue;
+                    }
+#                ], [
+#                    eof =>
+#                    sub {
+#                        if ($spawn_ok) {
+#                            die "ERROR: premature EOF in login.\n";
+#                        } else {
+#                            die "ERROR: could not spawn telnet.\n";
+#                        }
+#                    }
+                ], [
+                    timeout =>
+                    sub {
+                        die "timeout.\n";
+                    }
+                ],
+                '-re', '^\. OK',	# wait for OK
+            );
+
+            $exp->interact();
+            $exp->soft_close();
+            return;
+        }
+    }
+    die "could not find alias $opt_alias:$opt_type in $config_file\n";
+}
+
+sub imap_connect_orig() {
+    foreach my $account (get_accounts()) {
+        if (@$account[0] eq "$opt_alias:$opt_type") {
+            my $exp = Expect->spawn("$OPENSSL s_client -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
+            $exp->expect(0);
+            $exp->send(". login @$account[2] @$account[3]\n");
+            $exp->interact();
+            $exp->soft_close();
+            return;
+        }
+    }
+    die "could not find alias $opt_alias:$opt_type in $config_file\n";
+}
+
+# connects to an smtp server
+# tries only the first alias that matches
+sub smtp_connect() {
+    foreach my $account (get_accounts()) {
+        if (@$account[0] eq "$opt_alias:$opt_type") {
+            my $exp = Expect->spawn("$OPENSSL s_client -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
+            $exp->expect(10, '-re', '');
+            $exp->send(". login @$account[2] @$account[3]\n");
+            $exp->expect(10, '-re', '');
+            $exp->interact();
+            $exp->soft_close();
+            return;
+        }
+    }
+    die "could not find alias $opt_alias:$opt_type in $config_file\n";
+}
+
+# connects to a pop3 server
+# tries only the first alias that matches
+sub pop3_connect() {
+    foreach my $account (get_accounts()) {
+        if (@$account[0] eq "$opt_alias:$opt_type") {
+            my $exp = Expect->spawn("$OPENSSL s_client -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
+
+            my $sent_user = 0;
+            my $sent_pass = 0;
+            $exp->expect($timeout,
+                [
+                    '-re',
+                    '^\+OK',
+                    sub {
+                        my $fh = shift;
+                        if (!$sent_user) {
+                            $fh->send("USER @$account[2]\n");
+                            $sent_user = 1;
+                            exp_continue;
+                        } elsif (!$sent_pass) {
+                            $fh->send("PASS @$account[3]\n");
+                            $sent_pass = 1;
+                            exp_continue;
+                        }
+                    }
+                ], [
+                    '-re', '^-ERR',
+                    sub {
+                        my $fh = shift;
+                        $fh->send("QUIT\n");
+                    }
+                ], [
+                    timeout =>
+                    sub {
+                        die "timeout.\n";
+                    }
+                ],
+                '-re', '^\+OK',		# wait for OK
+            );
+
+            $exp->interact();
+            $exp->soft_close();
+            return;
+        }
+    }
+    die "could not find alias $opt_alias:$opt_type in $config_file\n";
+}
+
+# returns true if an alias exists.
+# if passed a value other than 0, it will prompt whether to overwrite, and die if denied.
+sub check_for_alias($) {
+    my $verify = $_;
+    foreach (get_aliases()) {
+        if ($_ eq "$opt_alias:$opt_type") {
+            if ($verify) {
+                print "alias $opt_alias:$opt_type already defined in $config_file. do you wish to overwrite? ";
+                chop(my $overwrite=<STDIN>);
+                if ($overwrite =~ /^(y|yes)$/i) {
+                    print "overwriting $opt_alias:$opt_type in $config_file\n";
+                    return 1;
+                } else {
+                    die "not overwriting $opt_alias:$opt_type in $config_file\n";
+                }
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# adds or changes an alias in config file.
+sub create_alias() {
+    my $alias_defined = check_for_alias(1);
+    my $password = '';
+    my $password2 = '';
+    my @accounts;
+
+    if (-e "$config_file") {
+        #prompt_for_passphrase();
+        @accounts = get_accounts();
+    } else {
+        prompt_for_new_passphrase();
+    }
+
+    do {
+        print "enter account password:\n";
+        system('stty','-echo');
+        chop($password=<STDIN>);
+        print "enter password again:\n";
+        chop($password2=<STDIN>);
+        print "passwords do not match! " if ($password ne $password2);
+    } while ($password ne $password2);
+
+    my $cleartext = "$opt_server:$opt_port $opt_username $password";
+
+    my $cipher = Crypt::CBC->new(
+        -key    => $::passphrase,
+        -cipher => "Crypt::OpenSSL::AES"
+    );
+    system('stty','echo');
+    my $encrypted = encode_base64($cipher->encrypt($cleartext), '');
+
+    if ($alias_defined) {
+        rename($config_file, "$config_file~") || die "cannot backup $config_file\n";
+        open(CONFIG, ">$config_file") || die "cannot open config file $config_file\n";
+        chmod(0600, $config_file) or die "Couldn't chmod $config_file: $!";
+        foreach my $account (@accounts) {
+            if (@$account[0] eq $opt_alias) {
+                print CONFIG "$opt_alias $encrypted\n";
+            } else {
+                my $encrypted = encode_base64($cipher->encrypt("@$account[1] @$account[2] @$account[3]"), '');
+                print CONFIG "@$account[0] $encrypted\n";
+            }
+        }
+    } else {
+        open(CONFIG, ">>$config_file") || die "cannot open config file $config_file\n";
+        chmod(0600, $config_file) or die "Couldn't chmod $config_file: $!";
+        print CONFIG "$opt_alias:$opt_type $encrypted\n";
+    }
+    close(CONFIG);
+}
+
+# lists all known aliases on one line.
+sub list_aliases() {
+    print "Aliases:";
+    foreach (get_aliases()) {
+        print " $_";
+    }
+    print "\n";
+}
+
+sub main() {
+    if (($opt_server xor $opt_username) ||			# both must be defined
+            ($opt_port && !$opt_server) ||			# port only used if server defined
+            !($opt_list || ($opt_alias xor $ARGV[0])) ||	# alias as option and as argument cannot be defined.
+            ($opt_list && ($opt_alias || $ARGV[0]))) {		# list cannot be defined with alias.
+        help();
+        exit(1);
+    } elsif ($opt_type && !$types{$opt_type}) {
+        my @keys = keys %types;
+        die "invalid type $opt_type -- valid options are: @keys\n";
+    } elsif ($opt_help) {
+        help();
+        exit(0);
+    }
+
+    $opt_alias = ($opt_alias) ? $opt_alias : $ARGV[0];
+    $opt_type = ($opt_type) ? $opt_type : $default_type;
+    $opt_port = ($opt_port) ? $opt_port : $types{$opt_type};
+
+    if ($opt_list) {
+        list_aliases();
+        exit(0);
+    } elsif ($opt_server and $opt_username) {
+        create_alias();
+        exit(0);
+    } else {
+        if (check_for_alias(0)) {
+            if ($opt_type eq "imap") {
+                imap_connect();
+                exit(0);
+            } elsif ($opt_type eq "smtp") {
+                smtp_connect();
+                exit(0);
+            } elsif ($opt_type eq "pop3") {
+                pop3_connect();
+                exit(0);
+            }
+        } else {
+            die "alias $opt_alias:$opt_type not found\n";
+        }
+    }
+}
+
+main();
