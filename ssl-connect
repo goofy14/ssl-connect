@@ -23,9 +23,11 @@ my $separator = " ";				# change this if needed (to TAB or NULL, for example)
 
 # NOTHING SHOULD BE CHANGED BELOW THIS LINE
 
+# global initialization.
 my %types = ( "imap" => 993,			# default ports as values for known types
               "smtp" => 465, 
               "pop3" => 995);
+
 my $default_type = "imap";
 
 my $opt_alias;
@@ -36,7 +38,7 @@ my $opt_username;
 my $opt_list = 0;
 my $opt_help = 0;
 
-my $options = GetOptions(
+GetOptions(
     "alias=s" => \$opt_alias,
     "server=s" => \$opt_server,
     "port=i" => \$opt_port,
@@ -47,7 +49,7 @@ my $options = GetOptions(
     "help" => \$opt_help,
 );
 
-# prints usage
+# prints usage.
 sub help() {
     print "Usage: ssl-connect [--config CONFIG_FILE] [--type TYPE] [--alias] ALIAS
        ssl-connect [--config CONFIG_FILE] --alias ALIAS --server SERVER \\
@@ -92,6 +94,7 @@ sub get_aliases() {
     return @aliases;
 }
 
+# prompts for passphrase once, setting $::passphrase.
 sub prompt_for_passphrase() {
     if (!$::passphrase) {
         print "enter passphrase:\n";
@@ -101,6 +104,8 @@ sub prompt_for_passphrase() {
     }
 }
 
+# prompts for passphrase twice, making sure they match, and setting $::passphrase.
+# loops until successful.
 sub prompt_for_new_passphrase() {
     if (!$::passphrase) {
         my $passphrase2 = '';
@@ -144,40 +149,26 @@ sub get_accounts() {
     return @accounts;
 }
 
-# connects to an imap server
-# tries only the first alias that matches
+# connects to an imap server.
+# tries only the first alias that matches.
 sub imap_connect() {
     foreach my $account (get_accounts()) {
         if (@$account[0] eq "$opt_alias:$opt_type") {
             my $exp = Expect->spawn("$OPENSSL s_client -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
-#            my $spawn_ok;
             $exp->expect($timeout,
                 [
-                    '-re',
-                    '^\* OK',
+                    '-re', '^\* OK',	# login
                     sub {
-#                        $spawn_ok = 1;
                         my $fh = shift;
-                        $fh->send(". login @$account[2] @$account[3]\n"); #$username\n");
+                        $fh->send(". login @$account[2] @$account[3]\n");
                         exp_continue;
                     }
                 ], [
-                    '-re', '^\. NO',
+                    '-re', '^\. NO',	# some sort of error, so quit
                     sub {
                         my $fh = shift;
                         $fh->send(". logout\n");
-                        #print STDERR "LOGIN NOT ACCEPTED\n";
-                        #exp_continue;
                     }
-#                ], [
-#                    eof =>
-#                    sub {
-#                        if ($spawn_ok) {
-#                            die "ERROR: premature EOF in login.\n";
-#                        } else {
-#                            die "ERROR: could not spawn telnet.\n";
-#                        }
-#                    }
                 ], [
                     timeout =>
                     sub {
@@ -195,49 +186,13 @@ sub imap_connect() {
     die "could not find alias $opt_alias:$opt_type in $config_file\n";
 }
 
-sub imap_connect_orig() {
-    foreach my $account (get_accounts()) {
-        if (@$account[0] eq "$opt_alias:$opt_type") {
-            my $exp = Expect->spawn("$OPENSSL s_client -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
-            $exp->expect(0);
-            $exp->send(". login @$account[2] @$account[3]\n");
-            $exp->interact();
-            $exp->soft_close();
-            return;
-        }
-    }
-    die "could not find alias $opt_alias:$opt_type in $config_file\n";
-}
-
-# connects to an smtp server
-# tries only the first alias that matches
+# connects to an smtp server.
+# tries only the first alias that matches.
+# only does AUTH PLAIN and AUTH LOGIN -- must be advertised.
 sub smtp_connect() {
     foreach my $account (get_accounts()) {
         if (@$account[0] eq "$opt_alias:$opt_type") {
             my $exp = Expect->spawn("$OPENSSL s_client -CAfile yahoo.pem -crlf -connect @$account[1]") or die "Cannot spawn: $!\n";
-
-# 220 mx.google.com ESMTP gf8sm9922774obc.3
-# EHLO androgynoid.com
-# 250-mx.google.com at your service, [96.18.15.251]
-# 250-SIZE 35882577
-# 250-8BITMIME
-# 250-AUTH LOGIN PLAIN XOAUTH
-# 250 ENHANCEDSTATUSCODES
-
-# "AUTH PLAIN " + encode_base64("\000" + @$account[2] + "\000" + @$account[3])
-# AUTH PLAIN BASE64BLAHBLAHBLAH
-# 535-5.7.1 Username and Password not accepted. Learn more at
-# 535 5.7.1 http://support.google.com/mail/bin/answer.py?answer=14257 ch5sm9983258obb.16
-# AUTH PLAIN BASE64BLAHBLAHBLAH
-# 235 2.7.0 Accepted
-
-# gmail:
-# AUTH LOGIN
-# 334 VXNlcm5hbWU6
-# encode_base64(@$account[2])
-# 334 UGFzc3dvcmQ6
-# encode_base64(@$account[3])
-# 235 2.7.0 Accepted
 
             my $auth_plain = 0;
             my $auth_login = 0;
@@ -245,7 +200,7 @@ sub smtp_connect() {
             my $sent_pass = 0;
             $exp->expect($timeout,
                 [
-                    '-re', '^220',
+                    '-re', '^220',			# introduce ourselves
                     sub {
                         my $fh = shift;
                         my $fqdn =  hostfqdn();
@@ -253,7 +208,7 @@ sub smtp_connect() {
                         exp_continue;
                     }
                 ], [
-                    '-re', '^250.*AUTH.* PLAIN',
+                    '-re', '^250.*AUTH.* PLAIN',	# preferred way to login
                     sub {
                         $auth_plain = 1;
                         chomp(my $userpass = encode_base64("\000" . @$account[2] . "\000" . @$account[3]));
@@ -262,7 +217,7 @@ sub smtp_connect() {
                         exp_continue;
                     }
                 ], [
-                    '-re', '^250.*AUTH.* LOGIN',
+                    '-re', '^250.*AUTH.* LOGIN',	# alternate way
                     sub {
                         if (!$auth_plain) {
                             $auth_login = 1;
@@ -272,7 +227,7 @@ sub smtp_connect() {
                         }
                     }
                 ], [
-                    '-re', '^334 ',
+                    '-re', '^334',			# for logging into with AUTH LOGIN
                     sub {
                         my $fh = shift;
                         if ($auth_login) {
@@ -292,10 +247,10 @@ sub smtp_connect() {
                         }
                     }
                 ], [
-                    '-re', '^5',
+                    '-re', '^5',			# some sort of error, so quit
                     sub {
                         my $fh = shift;
-                        $fh->send("QUIT\n");
+                        $fh->send("quit\n");
                     }
                 ], [
                     timeout =>
@@ -303,7 +258,7 @@ sub smtp_connect() {
                         die "timeout.\n";
                     }
                 ],
-                '-re', '^235',		# 235 2.7.0 Accepted
+                '-re', '^235',				# wait for 235 (authenticated)
             );
 
             # openssl's s_client traps lines starting with 'R' and 'Q'
@@ -316,8 +271,8 @@ sub smtp_connect() {
     die "could not find alias $opt_alias:$opt_type in $config_file\n";
 }
 
-# connects to a pop3 server
-# tries only the first alias that matches
+# connects to a pop3 server.
+# tries only the first alias that matches.
 sub pop3_connect() {
     foreach my $account (get_accounts()) {
         if (@$account[0] eq "$opt_alias:$opt_type") {
@@ -327,8 +282,7 @@ sub pop3_connect() {
             my $sent_pass = 0;
             $exp->expect($timeout,
                 [
-                    '-re',
-                    '^\+OK',
+                    '-re', '^\+OK',	# login
                     sub {
                         my $fh = shift;
                         if (!$sent_user) {
@@ -342,7 +296,7 @@ sub pop3_connect() {
                         }
                     }
                 ], [
-                    '-re', '^-ERR',
+                    '-re', '^-ERR',	# some sort of error, so quit
                     sub {
                         my $fh = shift;
                         $fh->send("quit\n");
@@ -393,8 +347,9 @@ sub check_for_alias($) {
 # returns 1 if alias found with any type, setting $opt_type to the first type found.
 sub guess_and_set_type($) {
     return 0 unless ($_[0]);
+    my $types = join('|', keys %types);
     foreach (get_aliases()) {
-        if ($_ =~ /^$opt_alias:(?:imap|smtp|pop3)$/) {
+        if ($_ =~ /^$opt_alias:(?:$types)$/) {
             (my $alias, $opt_type) = split(/:/);
             return 1;
         }
@@ -463,6 +418,7 @@ sub list_aliases() {
     print "\n";
 }
 
+# main.
 sub main() {
     # option sanity
     if (($opt_server xor $opt_username) ||			# both must be defined
