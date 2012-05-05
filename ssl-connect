@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 
-# Copyright 2012 Ashley Willis <ashley@androgynoid.com>
+# Copyright 2012 Ashley Willis <ashley.github@gmail.com>
 # Licensed under both the GNU General Public License version 2 or later, and the Artistic License.
 
 # requires the command-line program "openssl" to be in path.
@@ -81,7 +81,7 @@ Options:
   -h, --help                  this help
   -v, --version               version information (this is version $VERSION)
 
-Copyright 2012 Ashley Willis <ashley\@androgynoid.com>
+Copyright 2012 Ashley Willis <ashley.github\@gmail.com>
 Licensed under both the GNU General Public License version 2 or later, and the
 Artistic License.\n";
 }
