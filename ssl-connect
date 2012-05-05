@@ -22,6 +22,8 @@ my $separator = " ";				# change this if needed (to TAB or NULL, for example)
 
 # NOTHING SHOULD BE CHANGED BELOW THIS LINE
 
+my $VERSION = "1.0-RC1";
+
 # global initialization.
 my %types = ( "imap" => 993,			# default ports as values for known types
               "smtp" => 465, 
@@ -36,8 +38,11 @@ my $opt_type;
 my $opt_username;
 my $opt_list = 0;
 my $opt_help = 0;
+my $opt_version = 0;
 
-GetOptions(
+Getopt::Long::Configure("pass_through");
+
+my $options = GetOptions(
     "alias=s" => \$opt_alias,
     "server=s" => \$opt_server,
     "port=i" => \$opt_port,
@@ -46,6 +51,7 @@ GetOptions(
     "config=s" => \$config_file,
     "list" => \$opt_list,
     "help" => \$opt_help,
+    "version" => \$opt_version,
 );
 
 # prints usage.
@@ -73,10 +79,15 @@ Options:
   -c, --config=CONFIG_FILE    specify config file (default: ~/.ssl-connect)
   -l, --list                  list account aliases
   -h, --help                  this help
+  -v, --version               version information (this is version $VERSION)
 
 Copyright 2012 Ashley Willis <ashley\@androgynoid.com>
 Licensed under both the GNU General Public License version 2 or later, and the
 Artistic License.\n";
+}
+
+sub version() {
+    print "ssl-connect version $VERSION\n";
 }
 
 # returns an array of account aliases. does not require a password.
@@ -424,9 +435,16 @@ sub list_aliases() {
 sub main() {
     # option sanity
     if (($opt_server xor $opt_username) ||			# both must be defined
+            (!$options && !$ARGV[0]) ||				# no valid options nor alias
+            (@ARGV > 1) ||					# only one argument (alias) allowed
+            ($ARGV[0] =~ /^-/) ||				# unknown option
             ($opt_port && !$opt_server) ||			# port only used if server defined
-            !($opt_list || ($opt_alias xor $ARGV[0])) ||	# alias as option and as argument cannot be defined.
-            ($opt_list && ($opt_alias || $ARGV[0]))) {		# list cannot be defined with alias.
+            ($opt_alias && $ARGV[0]) ||				# both cannot be defined together
+            ($opt_list && $opt_version) ||			# both cannot be defined together
+            ($opt_list && $opt_help) ||				# both cannot be defined together
+            ($opt_help && $opt_version) ||			# both cannot be defined together
+            (($opt_list || $opt_help || $opt_version) &&
+                    ($opt_alias || $ARGV[0]))) {		# list|help|version cannot be defined with alias
         help();
         exit(1);
     } elsif ($opt_type && !$types{$opt_type}) {
@@ -434,6 +452,9 @@ sub main() {
         die "invalid type $opt_type -- valid options are: @keys\n";
     } elsif ($opt_help) {
         help();
+        exit(0);
+    } elsif ($opt_version) {
+        version();
         exit(0);
     }
 
