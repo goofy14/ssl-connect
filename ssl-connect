@@ -5,14 +5,13 @@
 
 # requires the command-line program "openssl" to be in path.
 
-# notes: stty is not portable.
-
 use strict;
 use Expect;
 use Crypt::CBC;					# also requires Crypt::OpenSSL::AES
 use MIME::Base64;
 use Getopt::Long;
 use Net::Domain qw(hostfqdn);
+use Term::ReadKey;
 
 # you might need to change these:
 my $timeout = 5;
@@ -98,9 +97,9 @@ sub get_aliases() {
 sub prompt_for_passphrase() {
     if (!$::passphrase) {
         print "enter passphrase:\n";
-        system('stty','-echo');
-        chop($::passphrase=<STDIN>);
-        system('stty','echo');
+        ReadMode("noecho");
+        chomp($::passphrase = ReadLine(0));
+        ReadMode("restore");
     }
 }
 
@@ -109,13 +108,15 @@ sub prompt_for_passphrase() {
 sub prompt_for_new_passphrase() {
     if (!$::passphrase) {
         my $passphrase2 = '';
+        ReadMode("noecho");
         do {
             print "enter passphrase to encrypt with:\n";
-            chop($::passphrase=<STDIN>);
+            chomp($::passphrase = ReadLine(0));
             print "enter passphrase again:\n";
-            chop($passphrase2=<STDIN>);
+            chomp($passphrase2 = ReadLine(0));
             print "passphrases do not match! " if ($::passphrase ne $passphrase2);
         } while ($::passphrase ne $passphrase2);
+        ReadMode("restore");
     }
 }
 
@@ -359,26 +360,28 @@ sub guess_and_set_type($) {
 
 # adds or changes an alias in config file.
 sub create_alias() {
-    my $alias_defined = check_for_alias(1);
+    my $alias_defined = 0;
     my $password = '';
     my $password2 = '';
     my @accounts;
 
     # ask for passphase just one and make sure we can decrypt the data first if a config file exists
     if (-e "$config_file") {
+        $alias_defined = check_for_alias(1);
         @accounts = get_accounts();
     } else {
         prompt_for_new_passphrase();
     }
 
+    ReadMode("noecho");
     do {
         print "enter account password:\n";
-        system('stty','-echo');
-        chop($password=<STDIN>);
+        chomp($password = ReadLine(0));
         print "enter password again:\n";
-        chop($password2=<STDIN>);
+        chomp($password2 = ReadLine(0));
         print "passwords do not match! " if ($password ne $password2);
     } while ($password ne $password2);
+    ReadMode("restore");
 
     my $cleartext = "$opt_server:$opt_port $opt_username $password";
 
@@ -386,7 +389,6 @@ sub create_alias() {
         -key    => $::passphrase,
         -cipher => "Crypt::OpenSSL::AES"
     );
-    system('stty','echo');
     my $encrypted = encode_base64($cipher->encrypt($cleartext), '');
 
     if ($alias_defined) {
